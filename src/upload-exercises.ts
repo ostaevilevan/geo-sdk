@@ -148,6 +148,35 @@ async function getTypeProperties(typeId: string, idIdx: Map<string, GeoEntity>):
   return props;
 }
 
+// ── GET CURRENT DATA OF AN EXISTING ENTITY ───────────────────────────────────
+// Returns which text propertyIds are already filled, and which relation typeIds exist
+interface EntityCurrentData {
+  filledTextProps: Set<string>;          // propertyIds that already have a text value
+  filledRelations: Map<string, Set<string>>; // typeId → set of toEntity IDs already linked
+}
+
+async function getEntityCurrentData(entityId: string): Promise<EntityCurrentData> {
+  const data = await gql(`{
+    entity(id: "${entityId}") {
+      valuesList  { propertyId text }
+      relationsList { typeId toEntity { id } }
+    }
+  }`);
+
+  const filledTextProps = new Set<string>();
+  for (const v of data?.entity?.valuesList ?? []) {
+    if (v.text) filledTextProps.add(v.propertyId);
+  }
+
+  const filledRelations = new Map<string, Set<string>>();
+  for (const r of data?.entity?.relationsList ?? []) {
+    if (!filledRelations.has(r.typeId)) filledRelations.set(r.typeId, new Set());
+    if (r.toEntity?.id) filledRelations.get(r.typeId)!.add(r.toEntity.id);
+  }
+
+  return { filledTextProps, filledRelations };
+}
+
 // ── FIND ENTITY FOR RELATION ──────────────────────────────────────────────────
 // Matches by: name + expected type + space must be target or root
 function findEntityForRelation(
@@ -314,66 +343,106 @@ async function main() {
   const trainingCatPropId   = prop("Training category");
   const variationsPropId    = prop("Variations");
 
-  let skipped = 0;
+  let newCount = 0;
+  let patchedCount = 0;
 
-  batch.forEach((ex: any, i: number) => {
+  // Process exercises sequentially (needs async for patch queries)
+  for (let i = 0; i < batch.length; i++) {
+    const ex = batch[i];
     const name = ex["Entity Name"] as string;
 
     // Check if exercise already exists (name + type + space)
     const existing = findEntityForRelation(name, exerciseType.id, targetIdx, rootIdx);
+
     if (existing) {
+      // ── PATCH: fill in any missing properties ──────────────────────────────
       idMap.set(name, existing.id);
-      skipped++;
-      return;
+      const current = await getEntityCurrentData(existing.id);
+
+      // Text properties — only add if currently empty
+      const missingValues: any[] = [];
+      const textCols: [string | null, string][] = [
+        [descPropId,             ex["Description"]       ?? ""],
+        [commonMistakesPropId,   ex["Common mistakes"]   ?? ""],
+        [equipmentPropId,        ex["Equipment"]         ?? ""],
+        [formCuesPropId,         ex["Form cues"]         ?? ""],
+        [primaryMusclesPropId,   ex["Primary muscles"]   ?? ""],
+        [secondaryMusclesPropId, ex["Secondary muscles"] ?? ""],
+      ];
+      for (const [propId, val] of textCols) {
+        if (propId && val && !current.filledTextProps.has(propId)) {
+          missingValues.push({ property: propId, type: "text", value: val });
+        }
+      }
+      if (missingValues.length > 0) {
+        const update = Graph.updateEntity({ id: existing.id, values: missingValues });
+        allOps.push(...update.ops);
+        patchedCount++;
+      }
+
+      // Relation properties — only add relations that don't already exist
+      const relCols: [string[], string | null, string | null][] = [
+        [splitVal(ex["Body systems"]),     bodySystemPropId,  bodySystemType?.id   ?? null],
+        [splitVal(ex["Difficulty"]),        difficultyPropId,  difficultyType?.id   ?? null],
+        [splitVal(ex["Exercise type"]),     exTypePropId,      exTypeType?.id       ?? null],
+        [splitVal(ex["Related topics"]),    relTopicPropId,    relatedTopicType?.id ?? null],
+        [splitVal(ex["Training category"]), trainingCatPropId, trainingCatType?.id  ?? null],
+        [splitVal(ex["Variations"]),        variationsPropId,  variationType?.id    ?? null],
+      ];
+      for (const [vals, propId, expectedTypeId] of relCols) {
+        if (!propId || !expectedTypeId) continue;
+        const existingTargets = current.filledRelations.get(propId) ?? new Set();
+        for (const val of vals) {
+          let toId = idMap.get(val) ?? findEntityForRelation(val, expectedTypeId, targetIdx, rootIdx)?.id;
+          if (!toId) { console.warn(`    ⚠ Relation target not found: "${val}"`); continue; }
+          if (existingTargets.has(toId)) continue; // already linked
+          const r = Graph.createRelation({ fromEntity: existing.id, toEntity: toId, type: propId });
+          allOps.push(...r.ops);
+        }
+      }
+
+    } else {
+      // ── CREATE: new entity ─────────────────────────────────────────────────
+      const values: any[] = [{ property: NAME_PROPERTY_ID, type: "text", value: name }];
+      if (descPropId)             values.push({ property: descPropId,             type: "text", value: ex["Description"]       ?? "" });
+      if (commonMistakesPropId)   values.push({ property: commonMistakesPropId,   type: "text", value: ex["Common mistakes"]   ?? "" });
+      if (equipmentPropId)        values.push({ property: equipmentPropId,        type: "text", value: ex["Equipment"]         ?? "" });
+      if (formCuesPropId)         values.push({ property: formCuesPropId,         type: "text", value: ex["Form cues"]         ?? "" });
+      if (primaryMusclesPropId)   values.push({ property: primaryMusclesPropId,   type: "text", value: ex["Primary muscles"]   ?? "" });
+      if (secondaryMusclesPropId) values.push({ property: secondaryMusclesPropId, type: "text", value: ex["Secondary muscles"] ?? "" });
+
+      const exercise = Graph.createEntity({
+        name,
+        types: [exerciseType.id],
+        values: values.filter(v => v.value),
+      });
+      allOps.push(...exercise.ops);
+      idMap.set(name, exercise.id);
+      newCount++;
+
+      // Relations
+      const rel = (vals: string[], propId: string | null, expectedTypeId: string | null) => {
+        if (!propId || !expectedTypeId) return;
+        for (const val of vals) {
+          const toId = idMap.get(val) ?? findEntityForRelation(val, expectedTypeId, targetIdx, rootIdx)?.id;
+          if (!toId) { console.warn(`    ⚠ Relation target not found: "${val}"`); continue; }
+          const r = Graph.createRelation({ fromEntity: exercise.id, toEntity: toId, type: propId });
+          allOps.push(...r.ops);
+        }
+      };
+
+      rel(splitVal(ex["Body systems"]),      bodySystemPropId,  bodySystemType?.id   ?? null);
+      rel(splitVal(ex["Difficulty"]),         difficultyPropId,  difficultyType?.id   ?? null);
+      rel(splitVal(ex["Exercise type"]),      exTypePropId,      exTypeType?.id       ?? null);
+      rel(splitVal(ex["Related topics"]),     relTopicPropId,    relatedTopicType?.id ?? null);
+      rel(splitVal(ex["Training category"]),  trainingCatPropId, trainingCatType?.id  ?? null);
+      rel(splitVal(ex["Variations"]),         variationsPropId,  variationType?.id    ?? null);
     }
 
-    // Build values — only include properties that were resolved from the type
-    const values: any[] = [
-      { property: NAME_PROPERTY_ID, type: "text", value: name },
-    ];
-    if (descPropId)           values.push({ property: descPropId,           type: "text", value: ex["Description"]      ?? "" });
-    if (commonMistakesPropId) values.push({ property: commonMistakesPropId, type: "text", value: ex["Common mistakes"]  ?? "" });
-    if (equipmentPropId)      values.push({ property: equipmentPropId,      type: "text", value: ex["Equipment"]        ?? "" });
-    if (formCuesPropId)       values.push({ property: formCuesPropId,       type: "text", value: ex["Form cues"]        ?? "" });
-    if (primaryMusclesPropId) values.push({ property: primaryMusclesPropId, type: "text", value: ex["Primary muscles"]  ?? "" });
-    if (secondaryMusclesPropId) values.push({ property: secondaryMusclesPropId, type: "text", value: ex["Secondary muscles"] ?? "" });
-
-    const exercise = Graph.createEntity({
-      name,
-      types: [exerciseType.id],
-      values: values.filter(v => v.value),
-    });
-
-    allOps.push(...exercise.ops);
-    idMap.set(name, exercise.id);
-
-    // Relation helper — only creates relation if property was resolved
-    const rel = (values: string[], propId: string | null, expectedTypeId: string | null) => {
-      if (!propId || !expectedTypeId) return;
-      for (const val of values) {
-        // Find target entity: name + expected type + target or root space
-        let toId = idMap.get(val);
-        if (!toId) {
-          const found = findEntityForRelation(val, expectedTypeId, targetIdx, rootIdx);
-          toId = found?.id;
-        }
-        if (!toId) { console.warn(`    ⚠ Relation target not found: "${val}"`); continue; }
-        const r = Graph.createRelation({ fromEntity: exercise.id, toEntity: toId, type: propId });
-        allOps.push(...r.ops);
-      }
-    };
-
-    rel(splitVal(ex["Body systems"]),      bodySystemPropId,  bodySystemType?.id  ?? null);
-    rel(splitVal(ex["Difficulty"]),         difficultyPropId,  difficultyType?.id  ?? null);
-    rel(splitVal(ex["Exercise type"]),      exTypePropId,      exTypeType?.id      ?? null);
-    rel(splitVal(ex["Related topics"]),     relTopicPropId,    relatedTopicType?.id ?? null);
-    rel(splitVal(ex["Training category"]),  trainingCatPropId, trainingCatType?.id ?? null);
-    rel(splitVal(ex["Variations"]),         variationsPropId,  variationType?.id   ?? null);
-
     if ((i + 1) % 10 === 0) console.log(`  ${i + 1}/${batch.length} processed`);
-  });
+  }
 
-  console.log(`  Skipped (already exist): ${skipped} | New: ${batch.length - skipped}`);
+  console.log(`  New: ${newCount} | Patched (missing props filled): ${patchedCount}`);
 
   if (allOps.length === 0) {
     console.log("\n✓ Nothing new to upload — all entities already exist.");
