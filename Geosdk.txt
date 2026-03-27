@@ -1,0 +1,114 @@
+# Geo Protocol SDK (v0.7.0) Master Context Document
+
+## 1. Project Configuration & Environment
+**package.json**
+- `"@geoprotocol/geo-sdk": "^0.7.0"`
+- `"dotenv": "^17.2.4"`
+- TypeScript environment using ES2022, moduleResolution: bundler.
+- Shared utilities exist in `src/functions.ts` (specifically `publishOps` for gas-sponsored transactions) and `src/constants.ts`.
+
+## 2. Core Data Model & Rules
+- **Dashless UUIDs:** All generated IDs must use `IdUtils.generate()` to create 32-character hex strings with no dashes (e.g., `7ed45f2bc48b419e8e4664d5ff680b0d`).
+- **The "Reuse" Mandate:** You MUST reuse Root Space properties and types whenever possible to ensure cross-graph interoperability. Only create *new* properties/types for domain-specific fields.
+- **Operations (Ops):** Every `Graph.*` function returns `{ id, ops }`. Operations are atomic mutations. They must be collected into an array and published together as an Edit.
+- **Relations are Properties:** Relations between entities are created using `Graph.createRelation()`. The `type` parameter must be a property ID with `dataType: "RELATION"`.
+
+## 3. Root Space Ontology (Well-Known IDs)
+Use these hardcoded IDs from the Root Space (`a19c345ab9866679b001d7d2138d88a1`) instead of creating new ones:
+
+**Data Types:**
+- `Text`: `db22a933c151866ca01a4d9e471d5797`
+- `Int64`: `4258025c2fa481c3a7acc4cbde4b82c2`
+- `Float64`: `d1f0423c3165808d942ff929bf9fc4ce`
+- `Bool`: `37a13ac05b6887ab83e772d4ece101ab`
+- `Date`: `31cc314f1c168c1cb49e6396b7510ed8`
+
+**Entity Types:**
+- `Person`: `7ed45f2bc48b419e8e4664d5ff680b0d`
+- `Project`: `484a18c5030a499cb0f2ef588ff16d50`
+- `Topic`: `5ef5a5860f274d8e8f6c59ae5b3e89e2`
+- `Text Block`: `76474f2f00894e77a0410b39fb17d0bf`
+- `Image`: `ba4e41460010499da0a3caaa7f579d0e`
+
+**Core Properties:**
+- `Name`: `a126ca530c8e48d5b88882c734c38935` (Text)
+- `Description`: `9b1f76ff9711404c861e59dc3fa7d037` (Text)
+- `Types`: `8f151ba4de204e3c9cb499ddf96f48f1` (Relation)
+- `Topics`: `458fbc070dbf4c928f5716f3fdde7c32` (Relation)
+- `Web URL`: `eed38e74e67946bf8a42ea3e4f8fb5fb` (Text)
+- `Markdown Content`: `e3e363d1dd294ccb8e6ff3b76d99bc33` (Text)
+- `Blocks`: `beaba5cba67741a8b35377030613fc70` (Relation)
+- `IPFS URL`: `8a743832c0944a62b6650c3cc2f9c7bc` (Text)
+
+## 4. Code Patterns & API Syntax
+
+### A. Schema Creation (Custom Properties & Types)
+```typescript
+import { Graph } from "@geoprotocol/geo-sdk";
+
+const customProp = Graph.createProperty({
+  name: "Target Muscle",
+  dataType: "TEXT",
+});
+
+const customType = Graph.createType({
+  name: "Exercise",
+  properties: [customProp.id, PROPERTIES.name, PROPERTIES.description],
+});
+// Collect customProp.ops and customType.ops
+
+const entityResult = Graph.createEntity({
+  name: "Bench Press",
+  types: [customType.id],
+  values: [
+    { property: PROPERTIES.name, type: "text", value: "Bench Press" },
+    { property: customProp.id, type: "text", value: "Chest" },
+  ],
+});
+// Collect entityResult.ops
+
+import { Position } from "@geoprotocol/geo-sdk";
+
+const pos1 = Position.generateBetween(null, null); 
+
+const relationResult = Graph.createRelation({
+  fromEntity: exerciseEntity.id,
+  toEntity: muscleGroupEntity.id,
+  type: PROPERTIES.topics, // Or a custom relation property ID
+  position: pos1, // Optional ordering
+});
+// Collect relationResult.ops
+
+
+
+
+// Update
+const updateResult = Graph.updateEntity({
+  id: entityId,
+  values: [{ property: statusProp.id, type: "text", value: "Published" }],
+});
+
+// Delete specific property
+const unsetResult = Graph.updateEntity({
+  id: entityId,
+  unset: [{ property: phoneProp.id }],
+});
+
+// Delete Relation
+const deleteRelResult = Graph.deleteRelation({ id: relationId });
+
+
+import { publishOps } from "../src/functions.js";
+
+const result = await publishOps({
+  ops: allOps,
+  editName: "Batch Import: Database",
+  privateKey: process.env.PRIVATE_KEY, // 0x... format required
+  spaceId: "52c7ae149838b6d47ce0f3b2a5974546", // Target Space ID
+  useSmartAccount: true, // Sponsored gas (No ETH required)
+  network: "TESTNET",
+});
+
+if (result.success) {
+  console.log(`Success! Edit ID: ${result.editId}`);
+}

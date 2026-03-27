@@ -1,0 +1,25 @@
+{
+  "name": "geo-sdk",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test-upload": "tsx src/test-upload.ts",
+    "upload-exercises": "tsx src/upload-exercises.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@geoprotocol/geo-sdk": "^0.14.0",
+    "dotenv": "^17.3.1",
+    "ox": "^0.8.9",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
