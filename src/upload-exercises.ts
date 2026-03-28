@@ -11,7 +11,11 @@ const TARGET_SPACE = "0c747ad3af58ed6b27221a256498068e";
 const ROOT_SPACE   = "a19c345ab9866679b001d7d2138d88a1";
 const GEO_API      = "https://testnet-api.geobrowser.io/graphql";
 const EXCEL_PATH   = "/Users/levan/Desktop/My best friend/Exercises Catalog (1).xlsx";
+const BATCH_OFFSET = 50;
 const BATCH_LIMIT  = 50;
+
+// ── EXERCISE TYPE (from health space) ────────────────────────────────────────
+const EXERCISE_TYPE_ID = "1362f6523665771634fafe2cd9a5854f";
 
 // ── GEO META-IDs (fixed, from Root Space) ────────────────────────────────────
 const SCHEMA_TYPE_ID               = "e7d737c536764c609fa16aa64a8c90ad"; // the "Type" meta-type
@@ -214,7 +218,9 @@ async function main() {
   // ── 2. RESOLVE TYPES (never create) ───────────────────────────────────────
   console.log("\nResolving types...");
 
-  const exerciseType    = findType("Exercise",          targetIdx, rootIdx);
+  // Exercise type is pinned to the health space type ID — no lookup needed
+  const exerciseType = { id: EXERCISE_TYPE_ID } as GeoEntity;
+
   const bodySystemType  = findType("Body system",       targetIdx, rootIdx);
   const difficultyType  = findType("Difficulty level",  targetIdx, rootIdx) ??
                           findType("Difficulty",         targetIdx, rootIdx);
@@ -225,9 +231,7 @@ async function main() {
   const variationType   = findType("Exercise variation",targetIdx, rootIdx) ??
                           findType("Exercise",           targetIdx, rootIdx);
 
-  if (!exerciseType) throw new Error("Exercise type not found in target space or root space. Cannot proceed.");
-
-  console.log(`  Exercise type      : ${exerciseType.id} (from ${exerciseType.spaceIds[0] === ROOT_SPACE ? "Root" : "target"} space)`);
+  console.log(`  Exercise type      : ${exerciseType.id} (health space — pinned)`);
   if (bodySystemType)  console.log(`  Body system type   : ${bodySystemType.id}`);
   if (difficultyType)  console.log(`  Difficulty type    : ${difficultyType.id}`);
   if (exTypeType)      console.log(`  Exercise type type : ${exTypeType.id}`);
@@ -270,7 +274,7 @@ async function main() {
   const trainingCatRows  = XLSX.utils.sheet_to_json<any>(wb.Sheets["Training Category - minus other"]);
   const variationRows    = XLSX.utils.sheet_to_json<any>(wb.Sheets["Variations"]);
 
-  const batch = exercises.slice(0, BATCH_LIMIT);
+  const batch = exercises.slice(BATCH_OFFSET, BATCH_OFFSET + BATCH_LIMIT);
 
   const referencedVariations = new Set<string>();
   batch.forEach((ex: any) =>
@@ -332,14 +336,14 @@ async function main() {
   // Resolve property IDs from the Exercise type (or well-known fallbacks)
   const descPropId          = prop("Description");
   const commonMistakesPropId= prop("Common mistakes");
-  const equipmentPropId     = prop("Equipment");
+  const equipmentPropId     = prop("Equipments");
   const formCuesPropId      = prop("Form cues");
   const primaryMusclesPropId= prop("Primary muscles");
   const secondaryMusclesPropId = prop("Secondary muscles");
-  const bodySystemPropId    = prop("Body system") ?? prop("Body systems");
+  const bodySystemPropId    = prop("Body systems");
   const difficultyPropId    = prop("Difficulty");
   const exTypePropId        = prop("Exercise type");
-  const relTopicPropId      = prop("Related topics");
+  const relTopicPropId      = prop("Related entities");
   const trainingCatPropId   = prop("Training category");
   const variationsPropId    = prop("Variations");
 
@@ -454,7 +458,7 @@ async function main() {
   console.log("Publishing to IPFS...");
 
   const { editId, to, calldata } = await personalSpace.publishEdit({
-    name: "Exercise Catalog — Batch 1 (50 exercises)",
+    name: "Exercise Catalog — Batch 2 (exercises 51–100)",
     spaceId: TARGET_SPACE,
     ops: allOps,
     author: TARGET_SPACE,
