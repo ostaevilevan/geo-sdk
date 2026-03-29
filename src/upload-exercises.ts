@@ -10,19 +10,33 @@ import {
 const TARGET_SPACE = "0c747ad3af58ed6b27221a256498068e";
 const ROOT_SPACE   = "a19c345ab9866679b001d7d2138d88a1";
 const GEO_API      = "https://testnet-api.geobrowser.io/graphql";
-const EXCEL_PATH   = "/Users/levan/Desktop/My best friend/Exercises Catalog (1).xlsx";
-const BATCH_OFFSET = 50;
-const BATCH_LIMIT  = 50;
+const EXCEL_PATH   = "/Users/levan/Desktop/GEO SDK/Exercises Catalog.xlsx";
+const BATCH_OFFSET = 100;
+const BATCH_LIMIT  = 5;
 
 // ── EXERCISE TYPE (from health space) ────────────────────────────────────────
 const EXERCISE_TYPE_ID = "1362f6523665771634fafe2cd9a5854f";
 
-// ── GEO META-IDs (fixed, from Root Space) ────────────────────────────────────
-const SCHEMA_TYPE_ID               = "e7d737c536764c609fa16aa64a8c90ad"; // the "Type" meta-type
-const PROPERTIES_RELATION_ID       = "01412f8381894ab1836565c7fd358cc1"; // type → its properties
-const RELATION_VALUE_TYPE_ID       = "9eea393f17dd4971a62ea603e8bfec20"; // property → expected entity type
-const NAME_PROPERTY_ID             = "a126ca530c8e48d5b88882c734c38935";
-const DESCRIPTION_PROPERTY_ID      = "9b1f76ff9711404c861e59dc3fa7d037";
+// ── GEO META-IDs ─────────────────────────────────────────────────────────────
+const SCHEMA_TYPE_ID         = "e7d737c536764c609fa16aa64a8c90ad";
+const PROPERTIES_RELATION_ID = "01412f8381894ab1836565c7fd358cc1";
+const RELATION_VALUE_TYPE_ID = "9eea393f17dd4971a62ea603e8bfec20";
+const NAME_PROPERTY_ID       = "a126ca530c8e48d5b88882c734c38935";
+const DESCRIPTION_PROPERTY_ID= "9b1f76ff9711404c861e59dc3fa7d037";
+
+// ── EXCEL COLUMN → GEO PROPERTY NAME (where they differ) ─────────────────────
+// Key = Excel column name, Value = GEO property name
+const COLUMN_TO_PROP: Record<string, string> = {
+  "Related topics": "Related entities",
+  "Body systems ":  "Body systems",   // Excel has a trailing space
+};
+
+function colForProp(propName: string): string {
+  for (const [col, geo] of Object.entries(COLUMN_TO_PROP)) {
+    if (geo === propName) return col;
+  }
+  return propName;
+}
 
 // ── INTERFACES ────────────────────────────────────────────────────────────────
 interface GeoEntity {
@@ -36,8 +50,7 @@ interface GeoEntity {
 interface GeoProperty {
   id: string;
   name: string;
-  spaceIds: string[];
-  expectedTypeId: string | null;   // what entity type this relation property expects
+  expectedTypeId: string | null;
   expectedTypeName: string | null;
 }
 
@@ -57,7 +70,6 @@ async function loadSpace(spaceId: string, label: string): Promise<GeoEntity[]> {
   const PAGE = 1000;
   let offset = 0;
   process.stdout.write(`Loading ${label}...`);
-
   while (true) {
     const data = await gql(`{
       entities(spaceId: "${spaceId}", first: ${PAGE}, offset: ${offset}) {
@@ -69,7 +81,6 @@ async function loadSpace(spaceId: string, label: string): Promise<GeoEntity[]> {
     offset += PAGE;
     if (page.length < PAGE) break;
   }
-
   console.log(` ${all.length} entities`);
   return all;
 }
@@ -90,33 +101,10 @@ function byId(entities: GeoEntity[]): Map<string, GeoEntity> {
   return new Map(entities.map(e => [e.id, e]));
 }
 
-// ── PICK BEST DUPLICATE (prefer entity with description) ─────────────────────
-function pickBest(candidates: GeoEntity[]): GeoEntity | null {
-  if (!candidates.length) return null;
-  return candidates.find(e => e.description) ?? candidates[0];
-}
-
-// ── FIND TYPE: target space first → root space ────────────────────────────────
-// A type is an entity whose typeIds includes SCHEMA_TYPE_ID
-function findType(
-  name: string,
-  targetIdx: Map<string, GeoEntity[]>,
-  rootIdx: Map<string, GeoEntity[]>
-): GeoEntity | null {
-  const key = name.toLowerCase().trim();
-  for (const idx of [targetIdx, rootIdx]) {
-    const match = (idx.get(key) ?? []).find(e => e.typeIds.includes(SCHEMA_TYPE_ID));
-    if (match) return match;
-  }
-  console.warn(`  ⚠ Type not found: "${name}" — skipping`);
-  return null;
-}
-
-// ── GET PROPERTIES OF A TYPE ──────────────────────────────────────────────────
-// Queries the type entity's PROPERTIES relations and each property's expected entity type
+// ── GET PROPERTIES OF A TYPE (with expected entity type per relation property) ─
 const propCache = new Map<string, GeoProperty[]>();
 
-async function getTypeProperties(typeId: string, idIdx: Map<string, GeoEntity>): Promise<GeoProperty[]> {
+async function getTypeProperties(typeId: string): Promise<GeoProperty[]> {
   if (propCache.has(typeId)) return propCache.get(typeId)!;
 
   const data = await gql(`{
@@ -132,31 +120,113 @@ async function getTypeProperties(typeId: string, idIdx: Map<string, GeoEntity>):
     }
   }`);
 
-  const relations: any[] = data?.entity?.relationsList ?? [];
   const props: GeoProperty[] = [];
-
-  for (const rel of relations) {
+  for (const rel of data?.entity?.relationsList ?? []) {
     if (rel.typeId !== PROPERTIES_RELATION_ID) continue;
     const pe = rel.toEntity;
     if (!pe?.name) continue;
-
-    // Find the expected entity type for this property (if it's a relation property)
     const valueTypeRel = pe.relationsList?.find((r: any) => r.toEntity?.name);
-    const expectedTypeId   = valueTypeRel?.toEntity?.id ?? null;
-    const expectedTypeName = valueTypeRel?.toEntity?.name ?? null;
-
-    props.push({ id: pe.id, name: pe.name, spaceIds: pe.spaceIds, expectedTypeId, expectedTypeName });
+    props.push({
+      id: pe.id,
+      name: pe.name,
+      expectedTypeId:   valueTypeRel?.toEntity?.id   ?? null,
+      expectedTypeName: valueTypeRel?.toEntity?.name ?? null,
+    });
   }
 
   propCache.set(typeId, props);
   return props;
 }
 
-// ── GET CURRENT DATA OF AN EXISTING ENTITY ───────────────────────────────────
-// Returns which text propertyIds are already filled, and which relation typeIds exist
+// ── FIND ENTITY BY NAME + TYPE IN TARGET/ROOT SPACE ───────────────────────────
+function findEntity(
+  name: string,
+  typeId: string,
+  targetIdx: Map<string, GeoEntity[]>,
+  rootIdx: Map<string, GeoEntity[]>
+): GeoEntity | null {
+  const key = name.toLowerCase().trim();
+  for (const idx of [targetIdx, rootIdx]) {
+    const match = (idx.get(key) ?? []).find(e => e.typeIds.includes(typeId));
+    if (match) return match;
+  }
+  return null;
+}
+
+// ── FIND ENTITY BY NAME ONLY (for properties with meta-type as expected type) ─
+function findEntityByName(
+  name: string,
+  targetIdx: Map<string, GeoEntity[]>,
+  rootIdx: Map<string, GeoEntity[]>
+): GeoEntity | null {
+  const key = name.toLowerCase().trim();
+  for (const idx of [targetIdx, rootIdx]) {
+    const candidates = idx.get(key) ?? [];
+    if (candidates.length > 0) return candidates[0];
+  }
+  return null;
+}
+
+// ── UNIVERSAL FIND-OR-CREATE FOR RELATION TARGETS ────────────────────────────
+// idMap key: "typeId::name" to avoid collisions across entity types
+function findOrCreate(
+  name: string,
+  prop: GeoProperty,
+  targetIdx: Map<string, GeoEntity[]>,
+  rootIdx: Map<string, GeoEntity[]>,
+  idMap: Map<string, string>,
+  allOps: any[]
+): string | null {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  const mapKey = `${prop.expectedTypeId}::${trimmed.toLowerCase()}`;
+  if (idMap.has(mapKey)) return idMap.get(mapKey)!;
+
+  // If expected type is the meta-type "Type" — search by name only, never auto-create
+  // (can't know what type to create; these should link to existing entities)
+  if (prop.expectedTypeId === SCHEMA_TYPE_ID) {
+    const existing = findEntityByName(trimmed, targetIdx, rootIdx);
+    if (existing) {
+      idMap.set(mapKey, existing.id);
+      return existing.id;
+    }
+    console.warn(`    ⚠ "${trimmed}" not found for "${prop.name}" (generic relation — skipping, cannot auto-create)`);
+    return null;
+  }
+
+  // Normal case: find by name + expected type
+  const existing = findEntity(trimmed, prop.expectedTypeId!, targetIdx, rootIdx);
+  if (existing) {
+    idMap.set(mapKey, existing.id);
+    return existing.id;
+  }
+
+  // Not found → create minimal entity (name only, leave other properties empty)
+  console.log(`    + Creating "${trimmed}" as ${prop.expectedTypeName ?? "entity"} (not found in target/root space)`);
+  const e = Graph.createEntity({
+    name: trimmed,
+    types: [prop.expectedTypeId!],
+    values: [{ property: NAME_PROPERTY_ID, type: "text", value: trimmed }],
+  });
+  allOps.push(...e.ops);
+  idMap.set(mapKey, e.id);
+
+  // Add to targetIdx so subsequent exercises in this batch find it
+  const key = trimmed.toLowerCase();
+  if (!targetIdx.has(key)) targetIdx.set(key, []);
+  targetIdx.get(key)!.push({
+    id: e.id, name: trimmed, description: null,
+    spaceIds: [TARGET_SPACE], typeIds: [prop.expectedTypeId!],
+  });
+
+  return e.id;
+}
+
+// ── GET CURRENT DATA OF AN EXISTING ENTITY (for patch mode) ──────────────────
 interface EntityCurrentData {
-  filledTextProps: Set<string>;          // propertyIds that already have a text value
-  filledRelations: Map<string, Set<string>>; // typeId → set of toEntity IDs already linked
+  filledTextProps: Set<string>;
+  filledRelations: Map<string, Set<string>>;
 }
 
 async function getEntityCurrentData(entityId: string): Promise<EntityCurrentData> {
@@ -166,38 +236,16 @@ async function getEntityCurrentData(entityId: string): Promise<EntityCurrentData
       relationsList { typeId toEntity { id } }
     }
   }`);
-
   const filledTextProps = new Set<string>();
   for (const v of data?.entity?.valuesList ?? []) {
     if (v.text) filledTextProps.add(v.propertyId);
   }
-
   const filledRelations = new Map<string, Set<string>>();
   for (const r of data?.entity?.relationsList ?? []) {
     if (!filledRelations.has(r.typeId)) filledRelations.set(r.typeId, new Set());
     if (r.toEntity?.id) filledRelations.get(r.typeId)!.add(r.toEntity.id);
   }
-
   return { filledTextProps, filledRelations };
-}
-
-// ── FIND ENTITY FOR RELATION ──────────────────────────────────────────────────
-// Matches by: name + expected type + space must be target or root
-function findEntityForRelation(
-  name: string,
-  expectedTypeId: string,
-  targetIdx: Map<string, GeoEntity[]>,
-  rootIdx: Map<string, GeoEntity[]>
-): GeoEntity | null {
-  const key = name.toLowerCase().trim();
-  for (const [idx, spaceId] of [[targetIdx, TARGET_SPACE], [rootIdx, ROOT_SPACE]] as [Map<string, GeoEntity[]>, string][]) {
-    const match = (idx.get(key) ?? []).find(e =>
-      e.typeIds.includes(expectedTypeId) &&
-      e.spaceIds.includes(spaceId)
-    );
-    if (match) return match;
-  }
-  return null;
 }
 
 // ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -209,256 +257,140 @@ async function main() {
   const targetEntities = await loadSpace(TARGET_SPACE, "target space");
   const rootEntities   = await loadSpace(ROOT_SPACE,   "root space  ");
 
-  const targetIdx  = byName(targetEntities);
-  const rootIdx    = byName(rootEntities);
-  const targetIdIdx = byId(targetEntities);
-  const rootIdIdx   = byId(rootEntities);
-  const allIdIdx    = new Map([...targetIdIdx, ...rootIdIdx]);
+  const targetIdx = byName(targetEntities);
+  const rootIdx   = byName(rootEntities);
 
-  // ── 2. RESOLVE TYPES (never create) ───────────────────────────────────────
-  console.log("\nResolving types...");
-
-  // Exercise type is pinned to the health space type ID — no lookup needed
-  const exerciseType = { id: EXERCISE_TYPE_ID } as GeoEntity;
-
-  const bodySystemType  = findType("Body system",       targetIdx, rootIdx);
-  const difficultyType  = findType("Difficulty level",  targetIdx, rootIdx) ??
-                          findType("Difficulty",         targetIdx, rootIdx);
-  const exTypeType      = findType("Exercise type",     targetIdx, rootIdx);
-  const trainingCatType = findType("Training category", targetIdx, rootIdx);
-  const relatedTopicType= findType("Related topic",     targetIdx, rootIdx) ??
-                          findType("Topic",              targetIdx, rootIdx);
-  const variationType   = findType("Exercise variation",targetIdx, rootIdx) ??
-                          findType("Exercise",           targetIdx, rootIdx);
-
-  console.log(`  Exercise type      : ${exerciseType.id} (health space — pinned)`);
-  if (bodySystemType)  console.log(`  Body system type   : ${bodySystemType.id}`);
-  if (difficultyType)  console.log(`  Difficulty type    : ${difficultyType.id}`);
-  if (exTypeType)      console.log(`  Exercise type type : ${exTypeType.id}`);
-  if (trainingCatType) console.log(`  Training cat type  : ${trainingCatType.id}`);
-  if (relatedTopicType)console.log(`  Related topic type : ${relatedTopicType.id}`);
-  if (variationType)   console.log(`  Variation type     : ${variationType.id}`);
-
-  // ── 3. RESOLVE PROPERTIES FROM THE EXERCISE TYPE (never create) ───────────
+  // ── 2. LOAD EXERCISE TYPE PROPERTIES (dynamic — no hardcoding) ────────────
   console.log("\nResolving Exercise type properties...");
-  const exerciseProps = await getTypeProperties(exerciseType.id, allIdIdx);
+  const exerciseProps = await getTypeProperties(EXERCISE_TYPE_ID);
 
   if (exerciseProps.length === 0) {
-    console.warn("  ⚠ Exercise type has no properties defined. Text fields will use well-known IDs only.");
-  } else {
-    console.log(`  Found ${exerciseProps.length} properties: ${exerciseProps.map(p => p.name).join(", ")}`);
+    throw new Error("Exercise type has no properties — cannot continue.");
   }
 
-  // Helper: find property by column name (case-insensitive)
-  function prop(colName: string): string | null {
-    const p = exerciseProps.find(p => p.name.toLowerCase().trim() === colName.toLowerCase().trim());
-    if (!p) {
-      // Fall back to well-known IDs for Name and Description
-      if (colName.toLowerCase() === "name")        return NAME_PROPERTY_ID;
-      if (colName.toLowerCase() === "description") return DESCRIPTION_PROPERTY_ID;
-      console.warn(`  ⚠ Property "${colName}" not found on Exercise type — column will be skipped`);
-      return null;
-    }
-    return p.id;
+  console.log(`  Found ${exerciseProps.length} properties:`);
+  for (const p of exerciseProps) {
+    const kind = p.expectedTypeId ? `RELATION → ${p.expectedTypeName}` : "TEXT";
+    console.log(`    ${p.name.padEnd(22)} [${kind}]`);
   }
 
-  // ── 4. READ EXCEL ──────────────────────────────────────────────────────────
+  // ── 3. READ EXCEL ──────────────────────────────────────────────────────────
   console.log("\nReading Excel...");
   const wb = XLSX.readFile(EXCEL_PATH);
-
-  const exercises        = XLSX.utils.sheet_to_json<any>(wb.Sheets["Exercises"]);
-  const bodySystemRows   = XLSX.utils.sheet_to_json<any>(wb.Sheets["Body System"]);
-  const difficultyRows   = XLSX.utils.sheet_to_json<any>(wb.Sheets["Difficulty"]);
-  const exerciseTypeRows = XLSX.utils.sheet_to_json<any>(wb.Sheets["Exercise type"]);
-  const relatedTopicRows = XLSX.utils.sheet_to_json<any>(wb.Sheets["Related topics"]);
-  const trainingCatRows  = XLSX.utils.sheet_to_json<any>(wb.Sheets["Training Category - minus other"]);
-  const variationRows    = XLSX.utils.sheet_to_json<any>(wb.Sheets["Variations"]);
-
+  const exercises = XLSX.utils.sheet_to_json<any>(wb.Sheets["Exercises"]);
   const batch = exercises.slice(BATCH_OFFSET, BATCH_OFFSET + BATCH_LIMIT);
+  console.log(`  Processing exercises ${BATCH_OFFSET + 1}–${BATCH_OFFSET + batch.length} of ${exercises.length}`);
 
-  const referencedVariations = new Set<string>();
-  batch.forEach((ex: any) =>
-    splitVal(ex["Variations"]).forEach(v => referencedVariations.add(v))
-  );
-
-  // ── 5. PROCESS SUPPORTING ENTITIES ────────────────────────────────────────
-  console.log("\nProcessing supporting entities...");
-
+  // ── 4. PROCESS EXERCISES ──────────────────────────────────────────────────
   const allOps: any[] = [];
-  const idMap = new Map<string, string>(); // entity name → id
-  let reused = 0;
-  let created = 0;
-
-  function upsertSupporting(name: string, description: string, typeEntity: GeoEntity | null): void {
-    if (!name || idMap.has(name)) return;
-    if (!typeEntity) {
-      console.warn(`  ⚠ Skipping "${name}" — type not resolved`);
-      return;
-    }
-
-    // Find existing: name + correct type + target or root space
-    const existing = findEntityForRelation(name, typeEntity.id, targetIdx, rootIdx);
-    if (existing) {
-      idMap.set(name, existing.id);
-      reused++;
-      return;
-    }
-
-    // Create new in target space with the resolved type
-    const e = Graph.createEntity({
-      name,
-      types: [typeEntity.id],
-      values: [
-        { property: NAME_PROPERTY_ID,        type: "text", value: name },
-        { property: DESCRIPTION_PROPERTY_ID, type: "text", value: description },
-      ].filter(v => v.value) as any,
-    });
-    idMap.set(name, e.id);
-    allOps.push(...e.ops);
-    created++;
-  }
-
-  bodySystemRows.forEach((r: any)   => upsertSupporting(r["Entity Name"], r["Description"] ?? "", bodySystemType));
-  difficultyRows.forEach((r: any)   => upsertSupporting(r["Entity Name"], r["Description"] ?? "", difficultyType));
-  exerciseTypeRows.forEach((r: any) => upsertSupporting(r["Entity Name"], r["Description"] ?? "", exTypeType));
-  relatedTopicRows.forEach((r: any) => upsertSupporting(r["Entity Name"], r["Description"] ?? "", relatedTopicType));
-  trainingCatRows.filter((r: any) => r["Name"])
-    .forEach((r: any) => upsertSupporting(r["Name"], r["Clear definition"] ?? "", trainingCatType));
-  variationRows
-    .filter((r: any) => r["Entity Name"] && referencedVariations.has(r["Entity Name"]))
-    .forEach((r: any) => upsertSupporting(r["Entity Name"], r["Description"] ?? "", variationType));
-
-  console.log(`  Reused: ${reused} | Created: ${created}`);
-
-  // ── 6. PROCESS EXERCISES ──────────────────────────────────────────────────
-  console.log(`\nProcessing ${batch.length} exercises...`);
-
-  // Resolve property IDs from the Exercise type (or well-known fallbacks)
-  const descPropId          = prop("Description");
-  const commonMistakesPropId= prop("Common mistakes");
-  const equipmentPropId     = prop("Equipments");
-  const formCuesPropId      = prop("Form cues");
-  const primaryMusclesPropId= prop("Primary muscles");
-  const secondaryMusclesPropId = prop("Secondary muscles");
-  const bodySystemPropId    = prop("Body systems");
-  const difficultyPropId    = prop("Difficulty");
-  const exTypePropId        = prop("Exercise type");
-  const relTopicPropId      = prop("Related entities");
-  const trainingCatPropId   = prop("Training category");
-  const variationsPropId    = prop("Variations");
-
+  const idMap = new Map<string, string>(); // "typeId::name" → entity id
   let newCount = 0;
   let patchedCount = 0;
 
-  // Process exercises sequentially (needs async for patch queries)
   for (let i = 0; i < batch.length; i++) {
     const ex = batch[i];
-    const name = ex["Entity Name"] as string;
+    const name = (ex["Entity Name"] as string)?.trim();
+    if (!name) continue;
 
-    // Check if exercise already exists (name + type + space)
-    const existing = findEntityForRelation(name, exerciseType.id, targetIdx, rootIdx);
+    console.log(`\n[${BATCH_OFFSET + i + 1}] ${name}`);
+
+    // Check if exercise already exists
+    const existing = findEntity(name, EXERCISE_TYPE_ID, targetIdx, rootIdx);
 
     if (existing) {
-      // ── PATCH: fill in any missing properties ──────────────────────────────
-      idMap.set(name, existing.id);
+      // ── PATCH: fill in only missing properties ─────────────────────────────
+      console.log(`  → exists (${existing.id}) — patching missing properties`);
       const current = await getEntityCurrentData(existing.id);
+      const missingText: any[] = [];
 
-      // Text properties — only add if currently empty
-      const missingValues: any[] = [];
-      const textCols: [string | null, string][] = [
-        [descPropId,             ex["Description"]       ?? ""],
-        [commonMistakesPropId,   ex["Common mistakes"]   ?? ""],
-        [equipmentPropId,        ex["Equipment"]         ?? ""],
-        [formCuesPropId,         ex["Form cues"]         ?? ""],
-        [primaryMusclesPropId,   ex["Primary muscles"]   ?? ""],
-        [secondaryMusclesPropId, ex["Secondary muscles"] ?? ""],
-      ];
-      for (const [propId, val] of textCols) {
-        if (propId && val && !current.filledTextProps.has(propId)) {
-          missingValues.push({ property: propId, type: "text", value: val });
+      for (const geoprop of exerciseProps) {
+        const colName = colForProp(geoprop.name);
+        const rawVal  = (ex[colName] ?? "").toString().trim();
+        if (!rawVal) continue;
+
+        if (geoprop.expectedTypeId === null) {
+          // Text property — add if not already filled
+          if (!current.filledTextProps.has(geoprop.id)) {
+            missingText.push({ property: geoprop.id, type: "text", value: rawVal });
+          }
+        } else {
+          // Relation property — add only missing links
+          const existingLinks = current.filledRelations.get(geoprop.id) ?? new Set();
+          for (const val of splitVal(rawVal)) {
+            const toId = findOrCreate(val, geoprop, targetIdx, rootIdx, idMap, allOps);
+            if (!toId || existingLinks.has(toId)) continue;
+            const r = Graph.createRelation({ fromEntity: existing.id, toEntity: toId, type: geoprop.id });
+            allOps.push(...r.ops);
+          }
         }
       }
-      if (missingValues.length > 0) {
-        const update = Graph.updateEntity({ id: existing.id, values: missingValues });
+
+      if (missingText.length > 0) {
+        const update = Graph.updateEntity({ id: existing.id, values: missingText });
         allOps.push(...update.ops);
         patchedCount++;
       }
 
-      // Relation properties — only add relations that don't already exist
-      const relCols: [string[], string | null, string | null][] = [
-        [splitVal(ex["Body systems"]),     bodySystemPropId,  bodySystemType?.id   ?? null],
-        [splitVal(ex["Difficulty"]),        difficultyPropId,  difficultyType?.id   ?? null],
-        [splitVal(ex["Exercise type"]),     exTypePropId,      exTypeType?.id       ?? null],
-        [splitVal(ex["Related topics"]),    relTopicPropId,    relatedTopicType?.id ?? null],
-        [splitVal(ex["Training category"]), trainingCatPropId, trainingCatType?.id  ?? null],
-        [splitVal(ex["Variations"]),        variationsPropId,  variationType?.id    ?? null],
-      ];
-      for (const [vals, propId, expectedTypeId] of relCols) {
-        if (!propId || !expectedTypeId) continue;
-        const existingTargets = current.filledRelations.get(propId) ?? new Set();
-        for (const val of vals) {
-          let toId = idMap.get(val) ?? findEntityForRelation(val, expectedTypeId, targetIdx, rootIdx)?.id;
-          if (!toId) { console.warn(`    ⚠ Relation target not found: "${val}"`); continue; }
-          if (existingTargets.has(toId)) continue; // already linked
-          const r = Graph.createRelation({ fromEntity: existing.id, toEntity: toId, type: propId });
+    } else {
+      // ── CREATE: new exercise entity ────────────────────────────────────────
+      console.log(`  → new entity`);
+      const textValues: any[] = [{ property: NAME_PROPERTY_ID, type: "text", value: name }];
+
+      // Collect text properties first
+      for (const geoprop of exerciseProps) {
+        if (geoprop.expectedTypeId !== null) continue; // skip relations for now
+        const colName = colForProp(geoprop.name);
+        const rawVal  = (ex[colName] ?? "").toString().trim();
+        if (rawVal) textValues.push({ property: geoprop.id, type: "text", value: rawVal });
+      }
+
+      const exercise = Graph.createEntity({
+        name,
+        types: [EXERCISE_TYPE_ID],
+        values: textValues.filter(v => v.value),
+      });
+      allOps.push(...exercise.ops);
+
+      // Register in index so same-batch exercises can find this as a variation target
+      const key = name.toLowerCase();
+      if (!targetIdx.has(key)) targetIdx.set(key, []);
+      targetIdx.get(key)!.push({
+        id: exercise.id, name, description: null,
+        spaceIds: [TARGET_SPACE], typeIds: [EXERCISE_TYPE_ID],
+      });
+
+      // Now add relation properties
+      for (const geoprop of exerciseProps) {
+        if (geoprop.expectedTypeId === null) continue; // skip text props
+        const colName = colForProp(geoprop.name);
+        const rawVal  = (ex[colName] ?? "").toString().trim();
+        if (!rawVal) continue;
+
+        for (const val of splitVal(rawVal)) {
+          const toId = findOrCreate(val, geoprop, targetIdx, rootIdx, idMap, allOps);
+          if (!toId) continue;
+          const r = Graph.createRelation({ fromEntity: exercise.id, toEntity: toId, type: geoprop.id });
           allOps.push(...r.ops);
         }
       }
 
-    } else {
-      // ── CREATE: new entity ─────────────────────────────────────────────────
-      const values: any[] = [{ property: NAME_PROPERTY_ID, type: "text", value: name }];
-      if (descPropId)             values.push({ property: descPropId,             type: "text", value: ex["Description"]       ?? "" });
-      if (commonMistakesPropId)   values.push({ property: commonMistakesPropId,   type: "text", value: ex["Common mistakes"]   ?? "" });
-      if (equipmentPropId)        values.push({ property: equipmentPropId,        type: "text", value: ex["Equipment"]         ?? "" });
-      if (formCuesPropId)         values.push({ property: formCuesPropId,         type: "text", value: ex["Form cues"]         ?? "" });
-      if (primaryMusclesPropId)   values.push({ property: primaryMusclesPropId,   type: "text", value: ex["Primary muscles"]   ?? "" });
-      if (secondaryMusclesPropId) values.push({ property: secondaryMusclesPropId, type: "text", value: ex["Secondary muscles"] ?? "" });
-
-      const exercise = Graph.createEntity({
-        name,
-        types: [exerciseType.id],
-        values: values.filter(v => v.value),
-      });
-      allOps.push(...exercise.ops);
-      idMap.set(name, exercise.id);
       newCount++;
-
-      // Relations
-      const rel = (vals: string[], propId: string | null, expectedTypeId: string | null) => {
-        if (!propId || !expectedTypeId) return;
-        for (const val of vals) {
-          const toId = idMap.get(val) ?? findEntityForRelation(val, expectedTypeId, targetIdx, rootIdx)?.id;
-          if (!toId) { console.warn(`    ⚠ Relation target not found: "${val}"`); continue; }
-          const r = Graph.createRelation({ fromEntity: exercise.id, toEntity: toId, type: propId });
-          allOps.push(...r.ops);
-        }
-      };
-
-      rel(splitVal(ex["Body systems"]),      bodySystemPropId,  bodySystemType?.id   ?? null);
-      rel(splitVal(ex["Difficulty"]),         difficultyPropId,  difficultyType?.id   ?? null);
-      rel(splitVal(ex["Exercise type"]),      exTypePropId,      exTypeType?.id       ?? null);
-      rel(splitVal(ex["Related topics"]),     relTopicPropId,    relatedTopicType?.id ?? null);
-      rel(splitVal(ex["Training category"]),  trainingCatPropId, trainingCatType?.id  ?? null);
-      rel(splitVal(ex["Variations"]),         variationsPropId,  variationType?.id    ?? null);
     }
-
-    if ((i + 1) % 10 === 0) console.log(`  ${i + 1}/${batch.length} processed`);
   }
 
-  console.log(`  New: ${newCount} | Patched (missing props filled): ${patchedCount}`);
+  console.log(`\nSummary: ${newCount} new | ${patchedCount} patched`);
 
   if (allOps.length === 0) {
-    console.log("\n✓ Nothing new to upload — all entities already exist.");
+    console.log("✓ Nothing new to upload.");
     return;
   }
 
-  // ── 7. PUBLISH ─────────────────────────────────────────────────────────────
+  // ── 5. PUBLISH ─────────────────────────────────────────────────────────────
   console.log(`\nTotal ops: ${allOps.length}`);
   console.log("Publishing to IPFS...");
 
   const { editId, to, calldata } = await personalSpace.publishEdit({
-    name: "Exercise Catalog — Batch 2 (exercises 51–100)",
+    name: `Exercise Catalog — Batch 3 (exercises ${BATCH_OFFSET + 1}–${BATCH_OFFSET + BATCH_LIMIT})`,
     spaceId: TARGET_SPACE,
     ops: allOps,
     author: TARGET_SPACE,
