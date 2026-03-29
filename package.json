@@ -4,8 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test-upload": "tsx src/test-upload.ts",
-    "upload-exercises": "tsx src/upload-exercises.ts"
+    "test-edit": "tsx src/test-edit.ts",
+    "publish-edit": "tsx src/publish-edit.ts",
+    "delete-edit": "tsx src/delete-entities.ts"
   },
   "keywords": [],
   "author": "",
