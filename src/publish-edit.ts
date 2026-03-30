@@ -23,6 +23,7 @@ const ROOT_TYPE_ID = "1362f6523665771634fafe2cd9a5854f"; // Exercise
 const SCHEMA_TYPE_ID         = "e7d737c536764c609fa16aa64a8c90ad";
 const PROPERTIES_RELATION_ID = "01412f8381894ab1836565c7fd358cc1";
 const RELATION_VALUE_TYPE_ID = "9eea393f17dd4971a62ea603e8bfec20";
+const VALUE_TYPE_RELATION_ID = "6d29d57849bb4959baf72cc696b1671a"; // data-type pointer: → Relation / Text / Date / etc.
 const NAME_PROPERTY_ID       = "a126ca530c8e48d5b88882c734c38935";
 const DESCRIPTION_PROPERTY_ID= "9b1f76ff9711404c861e59dc3fa7d037";
 
@@ -38,6 +39,7 @@ interface GeoEntity {
 interface GeoProperty {
   id: string;
   name: string;
+  isRelation: boolean;        // true even when expectedTypeId is null (untyped relation)
   expectedTypeId: string | null;
   expectedTypeName: string | null;
 }
@@ -179,10 +181,16 @@ async function getTypeProperties(typeId: string, spaceId: string): Promise<GeoPr
     if (rel.spaceId !== spaceId) continue;
     const pe = rel.toEntity;
     if (!pe?.name) continue;
-    const valueTypeRel = pe.relationsList?.find((r: any) => r.toEntity?.name);
+    const subRels: any[] = pe.relationsList ?? [];
+    // Data type: the VALUE_TYPE_RELATION_ID sub-relation tells us if this is a Relation, Text, Date, etc.
+    const dataTypeRel  = subRels.find((r: any) => r.typeId === VALUE_TYPE_RELATION_ID);
+    const isRelation   = dataTypeRel?.toEntity?.name === "Relation";
+    // Expected entity type: only present for typed relations
+    const valueTypeRel = subRels.find((r: any) => r.typeId === RELATION_VALUE_TYPE_ID);
     props.push({
       id: pe.id,
       name: pe.name,
+      isRelation,
       expectedTypeId:   valueTypeRel?.toEntity?.id   ?? null,
       expectedTypeName: valueTypeRel?.toEntity?.name ?? null,
     });
@@ -205,8 +213,8 @@ async function buildMapping(
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
   for (const geoprop of geoProps) {
-    const kind = geoprop.expectedTypeId
-      ? `RELATION → ${geoprop.expectedTypeName}`
+    const kind = geoprop.isRelation
+      ? (geoprop.expectedTypeName ? `RELATION → ${geoprop.expectedTypeName}` : "RELATION (untyped)")
       : "TEXT";
 
     // Try auto-match: exact name (case-insensitive, trimmed)
@@ -326,15 +334,15 @@ function findOrCreate(
   const mapKey = `${prop.expectedTypeId}::${trimmed.toLowerCase()}`;
   if (idMap.has(mapKey)) return idMap.get(mapKey)!;
 
-  // Generic meta-type: search by name only, never auto-create
-  if (prop.expectedTypeId === SCHEMA_TYPE_ID) {
+  // Untyped relation or generic meta-type: search by name only, never auto-create
+  if (!prop.expectedTypeId || prop.expectedTypeId === SCHEMA_TYPE_ID) {
     const existing = findEntityByName(trimmed, targetIdx, rootIdx);
     if (existing) { idMap.set(mapKey, existing.id); return existing.id; }
-    console.warn(`    ⚠ "${trimmed}" not found for "${prop.name}" (generic relation — skipping)`);
+    console.warn(`    ⚠ "${trimmed}" not found for "${prop.name}" (untyped relation — skipping)`);
     return null;
   }
 
-  // Normal: find by name + expected type
+  // Typed relation: find by name + expected type
   const existing = findEntity(trimmed, prop.expectedTypeId!, targetIdx, rootIdx);
   if (existing) { idMap.set(mapKey, existing.id); return existing.id; }
 
@@ -445,7 +453,7 @@ async function main() {
         const rawVal = (row[docCol] ?? "").toString().trim();
         if (!rawVal) continue;
 
-        if (geoprop.expectedTypeId === null) {
+        if (!geoprop.isRelation) {
           if (!current.filledTextProps.has(geoprop.id))
             missingText.push({ property: geoprop.id, type: "text", value: rawVal });
         } else {
@@ -471,7 +479,7 @@ async function main() {
       const textValues: any[] = [{ property: NAME_PROPERTY_ID, type: "text", value: name }];
 
       for (const geoprop of geoProps) {
-        if (geoprop.expectedTypeId !== null) continue;
+        if (geoprop.isRelation) continue;
         const docCol = mapping.get(geoprop.name);
         if (!docCol) continue;
         const rawVal = (row[docCol] ?? "").toString().trim();
@@ -493,7 +501,7 @@ async function main() {
       });
 
       for (const geoprop of geoProps) {
-        if (geoprop.expectedTypeId === null) continue;
+        if (!geoprop.isRelation) continue;
         const docCol = mapping.get(geoprop.name);
         if (!docCol) continue;
         const rawVal = (row[docCol] ?? "").toString().trim();
