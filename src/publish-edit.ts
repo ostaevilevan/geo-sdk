@@ -1,4 +1,5 @@
 import "dotenv/config";
+import * as readline from "readline";
 import XLSX from "xlsx";
 import {
   Graph,
@@ -11,11 +12,12 @@ const TARGET_SPACE = "0c747ad3af58ed6b27221a256498068e";
 const ROOT_SPACE   = "a19c345ab9866679b001d7d2138d88a1";
 const GEO_API      = "https://testnet-api.geobrowser.io/graphql";
 const EXCEL_PATH   = "/Users/levan/Desktop/GEO SDK/Exercises Catalog.xlsx";
+const SHEET_NAME   = "Exercises";
 const BATCH_OFFSET = 100;
 const BATCH_LIMIT  = 5;
 
-// ── EXERCISE TYPE (from health space) ────────────────────────────────────────
-const EXERCISE_TYPE_ID = "1362f6523665771634fafe2cd9a5854f";
+// ── ROOT TYPE TO UPLOAD (from health/root space) ──────────────────────────────
+const ROOT_TYPE_ID = "1362f6523665771634fafe2cd9a5854f"; // Exercise
 
 // ── GEO META-IDs ─────────────────────────────────────────────────────────────
 const SCHEMA_TYPE_ID         = "e7d737c536764c609fa16aa64a8c90ad";
@@ -23,20 +25,6 @@ const PROPERTIES_RELATION_ID = "01412f8381894ab1836565c7fd358cc1";
 const RELATION_VALUE_TYPE_ID = "9eea393f17dd4971a62ea603e8bfec20";
 const NAME_PROPERTY_ID       = "a126ca530c8e48d5b88882c734c38935";
 const DESCRIPTION_PROPERTY_ID= "9b1f76ff9711404c861e59dc3fa7d037";
-
-// ── EXCEL COLUMN → GEO PROPERTY NAME (where they differ) ─────────────────────
-// Key = Excel column name, Value = GEO property name
-const COLUMN_TO_PROP: Record<string, string> = {
-  "Related topics": "Related entities",
-  "Body systems ":  "Body systems",   // Excel has a trailing space
-};
-
-function colForProp(propName: string): string {
-  for (const [col, geo] of Object.entries(COLUMN_TO_PROP)) {
-    if (geo === propName) return col;
-  }
-  return propName;
-}
 
 // ── INTERFACES ────────────────────────────────────────────────────────────────
 interface GeoEntity {
@@ -53,6 +41,18 @@ interface GeoProperty {
   expectedTypeId: string | null;
   expectedTypeName: string | null;
 }
+
+// Resolved mapping: GEO property name → document column name (null = skip)
+type PropertyMapping = Map<string, string | null>;
+
+// ── CLI HELPER ────────────────────────────────────────────────────────────────
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+function ask(prompt: string): Promise<string> {
+  return new Promise(resolve => rl.question(prompt, answer => resolve(answer.trim())));
+}
+
+function closeInput() { rl.close(); }
 
 // ── GEO API HELPER ────────────────────────────────────────────────────────────
 async function gql(query: string): Promise<any> {
@@ -97,20 +97,73 @@ function byName(entities: GeoEntity[]): Map<string, GeoEntity[]> {
   return map;
 }
 
-function byId(entities: GeoEntity[]): Map<string, GeoEntity> {
-  return new Map(entities.map(e => [e.id, e]));
+// ── PICK WHICH SPACE'S VERSION OF A TYPE TO USE ───────────────────────────────
+async function pickTypeSpace(typeId: string): Promise<string> {
+  const data = await gql(`{
+    entity(id: "${typeId}") {
+      name
+      spaceIds
+    }
+  }`);
+
+  const typeName  = data?.entity?.name ?? typeId;
+  const spaceIds: string[] = data?.entity?.spaceIds ?? [];
+
+  if (spaceIds.length === 0) throw new Error(`Type "${typeName}" not found in any space.`);
+  if (spaceIds.length === 1) {
+    console.log(`\nType "${typeName}" exists in 1 space — using it automatically.`);
+    return spaceIds[0];
+  }
+
+  // Resolve space names
+  const spacesData = await gql(`{
+    spaces(filter: { id: { in: [${spaceIds.map(id => `"${id}"`).join(", ")}] } }) {
+      id
+      page { name }
+    }
+  }`);
+  const spaceNames = new Map<string, string>();
+  for (const s of spacesData?.spaces ?? []) {
+    spaceNames.set(s.id, s.page?.name ?? s.id);
+  }
+
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("  TYPE SPACE SELECTION");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log(`\n  Type "${typeName}" exists in ${spaceIds.length} spaces with different property sets:\n`);
+  spaceIds.forEach((id, i) => {
+    const label = spaceNames.get(id) ?? id;
+    console.log(`    ${i + 1}. ${label.padEnd(20)} (${id})`);
+  });
+  console.log();
+
+  let choice = -1;
+  while (choice < 1 || choice > spaceIds.length) {
+    const input = await ask(`  Which space's property set do you want to use? Enter number: `);
+    choice = parseInt(input);
+    if (isNaN(choice) || choice < 1 || choice > spaceIds.length) {
+      console.log(`  Please enter a number between 1 and ${spaceIds.length}.`);
+      choice = -1;
+    }
+  }
+
+  const chosen = spaceIds[choice - 1];
+  console.log(`\n  ✅ Using "${spaceNames.get(chosen) ?? chosen}" property set\n`);
+  return chosen;
 }
 
-// ── GET PROPERTIES OF A TYPE (with expected entity type per relation property) ─
+// ── GET PROPERTIES OF A TYPE (filtered by space) ──────────────────────────────
 const propCache = new Map<string, GeoProperty[]>();
 
-async function getTypeProperties(typeId: string): Promise<GeoProperty[]> {
-  if (propCache.has(typeId)) return propCache.get(typeId)!;
+async function getTypeProperties(typeId: string, spaceId: string): Promise<GeoProperty[]> {
+  const cacheKey = `${typeId}::${spaceId}`;
+  if (propCache.has(cacheKey)) return propCache.get(cacheKey)!;
 
   const data = await gql(`{
     entity(id: "${typeId}") {
       relationsList {
         typeId
+        spaceId
         toEntity { id name spaceIds
           relationsList(filter: { typeId: { in: ["${RELATION_VALUE_TYPE_ID}"] } }) {
             toEntity { id name }
@@ -123,6 +176,7 @@ async function getTypeProperties(typeId: string): Promise<GeoProperty[]> {
   const props: GeoProperty[] = [];
   for (const rel of data?.entity?.relationsList ?? []) {
     if (rel.typeId !== PROPERTIES_RELATION_ID) continue;
+    if (rel.spaceId !== spaceId) continue;
     const pe = rel.toEntity;
     if (!pe?.name) continue;
     const valueTypeRel = pe.relationsList?.find((r: any) => r.toEntity?.name);
@@ -134,11 +188,102 @@ async function getTypeProperties(typeId: string): Promise<GeoProperty[]> {
     });
   }
 
-  propCache.set(typeId, props);
+  propCache.set(cacheKey, props);
   return props;
 }
 
-// ── FIND ENTITY BY NAME + TYPE IN TARGET/ROOT SPACE ───────────────────────────
+// ── INTERACTIVE MAPPING BUILDER ───────────────────────────────────────────────
+async function buildMapping(
+  geoProps: GeoProperty[],
+  docColumns: string[]
+): Promise<PropertyMapping> {
+  const mapping: PropertyMapping = new Map();
+  const usedDocCols = new Set<string>();
+
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("  PROPERTY MAPPING");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+  for (const geoprop of geoProps) {
+    const kind = geoprop.expectedTypeId
+      ? `RELATION → ${geoprop.expectedTypeName}`
+      : "TEXT";
+
+    // Try auto-match: exact name (case-insensitive, trimmed)
+    const autoMatch = docColumns.find(
+      col => col.trim().toLowerCase() === geoprop.name.toLowerCase()
+    );
+
+    if (autoMatch && !usedDocCols.has(autoMatch)) {
+      mapping.set(geoprop.name, autoMatch);
+      usedDocCols.add(autoMatch);
+      console.log(`  ✅ "${geoprop.name}" [${kind}]`);
+      console.log(`     → auto-matched to column "${autoMatch}"\n`);
+      continue;
+    }
+
+    // No auto-match — ask the user
+    console.log(`  ⚠️  "${geoprop.name}" [${kind}]`);
+    console.log(`     No matching column found.\n`);
+
+    const available = docColumns.filter(col => !usedDocCols.has(col));
+
+    console.log(`     Available document columns:`);
+    available.forEach((col, i) => console.log(`       ${i + 1}. "${col}"`));
+    console.log(`       ${available.length + 1}. Skip this property (leave unfilled)`);
+
+    let choice = -1;
+    while (choice < 1 || choice > available.length + 1) {
+      const input = await ask(`\n     Which column maps to "${geoprop.name}"? Enter number: `);
+      choice = parseInt(input);
+      if (isNaN(choice) || choice < 1 || choice > available.length + 1) {
+        console.log(`     Please enter a number between 1 and ${available.length + 1}.`);
+        choice = -1;
+      }
+    }
+
+    if (choice === available.length + 1) {
+      mapping.set(geoprop.name, null);
+      console.log(`     → Skipped\n`);
+    } else {
+      const chosen = available[choice - 1];
+      mapping.set(geoprop.name, chosen);
+      usedDocCols.add(chosen);
+      console.log(`     → Mapped to "${chosen}"\n`);
+    }
+  }
+
+  // Warn about document columns not mapped to any GEO property
+  const unmappedDocCols = docColumns.filter(col => !usedDocCols.has(col));
+  if (unmappedDocCols.length > 0) {
+    console.log(`  ℹ️  Document columns with no GEO property match (will be ignored):`);
+    unmappedDocCols.forEach(col => console.log(`     - "${col}"`));
+    console.log();
+  }
+
+  // Full mapping summary
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("  MAPPING SUMMARY");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  for (const [geoProp, docCol] of mapping) {
+    const status = docCol ? `→ "${docCol}"` : "→ skipped";
+    console.log(`  ${geoProp.padEnd(25)} ${status}`);
+  }
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+  // Final confirmation
+  const confirm = await ask("  Proceed with this mapping? (y/n): ");
+  if (confirm.toLowerCase() !== "y") {
+    console.log("\n  Upload cancelled.");
+    closeInput();
+    process.exit(0);
+  }
+
+  console.log();
+  return mapping;
+}
+
+// ── FIND ENTITY BY NAME + TYPE ────────────────────────────────────────────────
 function findEntity(
   name: string,
   typeId: string,
@@ -153,7 +298,6 @@ function findEntity(
   return null;
 }
 
-// ── FIND ENTITY BY NAME ONLY (for properties with meta-type as expected type) ─
 function findEntityByName(
   name: string,
   targetIdx: Map<string, GeoEntity[]>,
@@ -168,7 +312,6 @@ function findEntityByName(
 }
 
 // ── UNIVERSAL FIND-OR-CREATE FOR RELATION TARGETS ────────────────────────────
-// idMap key: "typeId::name" to avoid collisions across entity types
 function findOrCreate(
   name: string,
   prop: GeoProperty,
@@ -183,27 +326,20 @@ function findOrCreate(
   const mapKey = `${prop.expectedTypeId}::${trimmed.toLowerCase()}`;
   if (idMap.has(mapKey)) return idMap.get(mapKey)!;
 
-  // If expected type is the meta-type "Type" — search by name only, never auto-create
-  // (can't know what type to create; these should link to existing entities)
+  // Generic meta-type: search by name only, never auto-create
   if (prop.expectedTypeId === SCHEMA_TYPE_ID) {
     const existing = findEntityByName(trimmed, targetIdx, rootIdx);
-    if (existing) {
-      idMap.set(mapKey, existing.id);
-      return existing.id;
-    }
-    console.warn(`    ⚠ "${trimmed}" not found for "${prop.name}" (generic relation — skipping, cannot auto-create)`);
+    if (existing) { idMap.set(mapKey, existing.id); return existing.id; }
+    console.warn(`    ⚠ "${trimmed}" not found for "${prop.name}" (generic relation — skipping)`);
     return null;
   }
 
-  // Normal case: find by name + expected type
+  // Normal: find by name + expected type
   const existing = findEntity(trimmed, prop.expectedTypeId!, targetIdx, rootIdx);
-  if (existing) {
-    idMap.set(mapKey, existing.id);
-    return existing.id;
-  }
+  if (existing) { idMap.set(mapKey, existing.id); return existing.id; }
 
-  // Not found → create minimal entity (name only, leave other properties empty)
-  console.log(`    + Creating "${trimmed}" as ${prop.expectedTypeName ?? "entity"} (not found in target/root space)`);
+  // Not found → create minimal entity (name only)
+  console.log(`    + Creating "${trimmed}" as ${prop.expectedTypeName ?? "entity"}`);
   const e = Graph.createEntity({
     name: trimmed,
     types: [prop.expectedTypeId!],
@@ -212,7 +348,6 @@ function findOrCreate(
   allOps.push(...e.ops);
   idMap.set(mapKey, e.id);
 
-  // Add to targetIdx so subsequent exercises in this batch find it
   const key = trimmed.toLowerCase();
   if (!targetIdx.has(key)) targetIdx.set(key, []);
   targetIdx.get(key)!.push({
@@ -256,65 +391,64 @@ async function main() {
   // ── 1. LOAD BOTH SPACES ────────────────────────────────────────────────────
   const targetEntities = await loadSpace(TARGET_SPACE, "target space");
   const rootEntities   = await loadSpace(ROOT_SPACE,   "root space  ");
-
   const targetIdx = byName(targetEntities);
   const rootIdx   = byName(rootEntities);
 
-  // ── 2. LOAD EXERCISE TYPE PROPERTIES (dynamic — no hardcoding) ────────────
-  console.log("\nResolving Exercise type properties...");
-  const exerciseProps = await getTypeProperties(EXERCISE_TYPE_ID);
+  // ── 2. PICK SPACE VERSION OF TYPE + LOAD PROPERTIES ──────────────────────
+  const typeSpaceId = await pickTypeSpace(ROOT_TYPE_ID);
+  console.log("Resolving type properties from GEO...");
+  const geoProps = await getTypeProperties(ROOT_TYPE_ID, typeSpaceId);
+  if (geoProps.length === 0) throw new Error("Type has no properties defined in GEO for the selected space.");
+  console.log(`  Found ${geoProps.length} properties on type`);
 
-  if (exerciseProps.length === 0) {
-    throw new Error("Exercise type has no properties — cannot continue.");
-  }
-
-  console.log(`  Found ${exerciseProps.length} properties:`);
-  for (const p of exerciseProps) {
-    const kind = p.expectedTypeId ? `RELATION → ${p.expectedTypeName}` : "TEXT";
-    console.log(`    ${p.name.padEnd(22)} [${kind}]`);
-  }
-
-  // ── 3. READ EXCEL ──────────────────────────────────────────────────────────
-  console.log("\nReading Excel...");
+  // ── 3. READ DOCUMENT ───────────────────────────────────────────────────────
+  console.log("\nReading document...");
   const wb = XLSX.readFile(EXCEL_PATH);
-  const exercises = XLSX.utils.sheet_to_json<any>(wb.Sheets["Exercises"]);
-  const batch = exercises.slice(BATCH_OFFSET, BATCH_OFFSET + BATCH_LIMIT);
-  console.log(`  Processing exercises ${BATCH_OFFSET + 1}–${BATCH_OFFSET + batch.length} of ${exercises.length}`);
+  const rows = XLSX.utils.sheet_to_json<any>(wb.Sheets[SHEET_NAME]);
+  const batch = rows.slice(BATCH_OFFSET, BATCH_OFFSET + BATCH_LIMIT);
 
-  // ── 4. PROCESS EXERCISES ──────────────────────────────────────────────────
+  // Get document columns (exclude entity name and type columns)
+  const docColumns = Object.keys(rows[0] ?? {}).filter(col =>
+    col !== "Entity Name" && col !== "Type"
+  );
+  console.log(`  ${rows.length} rows | ${docColumns.length} property columns | batch: ${BATCH_OFFSET + 1}–${BATCH_OFFSET + batch.length}`);
+
+  // ── 4. INTERACTIVE MAPPING ─────────────────────────────────────────────────
+  const mapping = await buildMapping(geoProps, docColumns);
+
+  // ── 5. PROCESS ENTITIES ────────────────────────────────────────────────────
+  console.log(`Processing ${batch.length} entities...\n`);
+
   const allOps: any[] = [];
-  const idMap = new Map<string, string>(); // "typeId::name" → entity id
+  const idMap = new Map<string, string>();
   let newCount = 0;
   let patchedCount = 0;
 
   for (let i = 0; i < batch.length; i++) {
-    const ex = batch[i];
-    const name = (ex["Entity Name"] as string)?.trim();
+    const row = batch[i];
+    const name = (row["Entity Name"] as string)?.trim();
     if (!name) continue;
 
-    console.log(`\n[${BATCH_OFFSET + i + 1}] ${name}`);
+    console.log(`[${BATCH_OFFSET + i + 1}] ${name}`);
 
-    // Check if exercise already exists
-    const existing = findEntity(name, EXERCISE_TYPE_ID, targetIdx, rootIdx);
+    const existing = findEntity(name, ROOT_TYPE_ID, targetIdx, rootIdx);
 
     if (existing) {
-      // ── PATCH: fill in only missing properties ─────────────────────────────
-      console.log(`  → exists (${existing.id}) — patching missing properties`);
+      // ── PATCH ──────────────────────────────────────────────────────────────
+      console.log(`  → exists — patching missing properties`);
       const current = await getEntityCurrentData(existing.id);
       const missingText: any[] = [];
 
-      for (const geoprop of exerciseProps) {
-        const colName = colForProp(geoprop.name);
-        const rawVal  = (ex[colName] ?? "").toString().trim();
+      for (const geoprop of geoProps) {
+        const docCol = mapping.get(geoprop.name);
+        if (!docCol) continue;
+        const rawVal = (row[docCol] ?? "").toString().trim();
         if (!rawVal) continue;
 
         if (geoprop.expectedTypeId === null) {
-          // Text property — add if not already filled
-          if (!current.filledTextProps.has(geoprop.id)) {
+          if (!current.filledTextProps.has(geoprop.id))
             missingText.push({ property: geoprop.id, type: "text", value: rawVal });
-          }
         } else {
-          // Relation property — add only missing links
           const existingLinks = current.filledRelations.get(geoprop.id) ?? new Set();
           for (const val of splitVal(rawVal)) {
             const toId = findOrCreate(val, geoprop, targetIdx, rootIdx, idMap, allOps);
@@ -332,44 +466,43 @@ async function main() {
       }
 
     } else {
-      // ── CREATE: new exercise entity ────────────────────────────────────────
+      // ── CREATE ─────────────────────────────────────────────────────────────
       console.log(`  → new entity`);
       const textValues: any[] = [{ property: NAME_PROPERTY_ID, type: "text", value: name }];
 
-      // Collect text properties first
-      for (const geoprop of exerciseProps) {
-        if (geoprop.expectedTypeId !== null) continue; // skip relations for now
-        const colName = colForProp(geoprop.name);
-        const rawVal  = (ex[colName] ?? "").toString().trim();
+      for (const geoprop of geoProps) {
+        if (geoprop.expectedTypeId !== null) continue;
+        const docCol = mapping.get(geoprop.name);
+        if (!docCol) continue;
+        const rawVal = (row[docCol] ?? "").toString().trim();
         if (rawVal) textValues.push({ property: geoprop.id, type: "text", value: rawVal });
       }
 
-      const exercise = Graph.createEntity({
+      const entity = Graph.createEntity({
         name,
-        types: [EXERCISE_TYPE_ID],
+        types: [ROOT_TYPE_ID],
         values: textValues.filter(v => v.value),
       });
-      allOps.push(...exercise.ops);
+      allOps.push(...entity.ops);
 
-      // Register in index so same-batch exercises can find this as a variation target
       const key = name.toLowerCase();
       if (!targetIdx.has(key)) targetIdx.set(key, []);
       targetIdx.get(key)!.push({
-        id: exercise.id, name, description: null,
-        spaceIds: [TARGET_SPACE], typeIds: [EXERCISE_TYPE_ID],
+        id: entity.id, name, description: null,
+        spaceIds: [TARGET_SPACE], typeIds: [ROOT_TYPE_ID],
       });
 
-      // Now add relation properties
-      for (const geoprop of exerciseProps) {
-        if (geoprop.expectedTypeId === null) continue; // skip text props
-        const colName = colForProp(geoprop.name);
-        const rawVal  = (ex[colName] ?? "").toString().trim();
+      for (const geoprop of geoProps) {
+        if (geoprop.expectedTypeId === null) continue;
+        const docCol = mapping.get(geoprop.name);
+        if (!docCol) continue;
+        const rawVal = (row[docCol] ?? "").toString().trim();
         if (!rawVal) continue;
 
         for (const val of splitVal(rawVal)) {
           const toId = findOrCreate(val, geoprop, targetIdx, rootIdx, idMap, allOps);
           if (!toId) continue;
-          const r = Graph.createRelation({ fromEntity: exercise.id, toEntity: toId, type: geoprop.id });
+          const r = Graph.createRelation({ fromEntity: entity.id, toEntity: toId, type: geoprop.id });
           allOps.push(...r.ops);
         }
       }
@@ -378,6 +511,7 @@ async function main() {
     }
   }
 
+  closeInput();
   console.log(`\nSummary: ${newCount} new | ${patchedCount} patched`);
 
   if (allOps.length === 0) {
@@ -385,12 +519,12 @@ async function main() {
     return;
   }
 
-  // ── 5. PUBLISH ─────────────────────────────────────────────────────────────
+  // ── 6. PUBLISH ─────────────────────────────────────────────────────────────
   console.log(`\nTotal ops: ${allOps.length}`);
   console.log("Publishing to IPFS...");
 
   const { editId, to, calldata } = await personalSpace.publishEdit({
-    name: `Exercise Catalog — Batch 3 (exercises ${BATCH_OFFSET + 1}–${BATCH_OFFSET + BATCH_LIMIT})`,
+    name: `Batch ${BATCH_OFFSET + 1}–${BATCH_OFFSET + BATCH_LIMIT}`,
     spaceId: TARGET_SPACE,
     ops: allOps,
     author: TARGET_SPACE,
@@ -416,6 +550,7 @@ function splitVal(val: unknown): string[] {
 }
 
 main().catch(err => {
+  closeInput();
   console.error("✗ Error:", err.message ?? err);
   process.exit(1);
 });
